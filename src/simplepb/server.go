@@ -7,8 +7,9 @@ package simplepb
 //
 
 import (
+	"log"
 	"sync"
-
+	"math"
 	"labrpc"
 )
 
@@ -32,6 +33,7 @@ type PBServer struct {
 	commitIndex int           // all log entries <= commitIndex are considered to have been committed.
 
 	// ... other state that you might need ...
+	opIndex     int                          // The operation index in the log assigned to the most recently received request, initially 0.
 }
 
 // Prepare defines the arguments for the Prepare RPC
@@ -48,6 +50,14 @@ type PrepareArgs struct {
 type PrepareReply struct {
 	View    int  // the backup's current view
 	Success bool // whether the Prepare request has been accepted or rejected
+}
+
+// A message signaling a successful response of a Prepare messge.
+type PrepareDone struct {
+	View int // the current view of the peer
+	OpIndex int // the op number that this is a succesful response to
+	Peer int // the index of the peer in the list of peers 
+	Success bool // whether the Prepare request has succeeded or failed
 }
 
 // RecoverArgs defined the arguments for the Recovery RPC
@@ -169,8 +179,54 @@ func (srv *PBServer) Start(command interface{}) (
 	}
 
 	// Your code here
+	// Normally, we would check the client table to see if we have already serviced this request.
+	// However, we do not have a last request number and cannot add one to the Start function.
+	srv.opIndex += 1
+	srv.log = append(srv.log, command)
 
-	return index, view, ok
+	// Normally, we would update the client table with the new request number before sending Prepare messages.
+
+	prepareOks := make(chan PrepareOk, len(srv.peers))
+
+	for peer := range srv.peers {
+		if peer != srv.me {
+			go srv.prepare(peer, PrepareArgs{View: srv.currentView, PrimaryCommit: srv.commitIndex, Index: srv.opIndex, Entry: command}, prepareOks)
+		}
+	}
+	
+	// TODO: await f PrepareOks
+
+	return srv.opIndex, view, ok
+}
+
+func (srv *PBServer) replicationFactor() int {
+	f := math.floor((len(srv.peers) - 1) / 2)
+	
+	if f <= 0 {
+		log.Fatalf("The replication factor f for the PBServer cannot be less than 1. %v <= 0", f)
+	}
+
+	return f
+}
+
+fun (srv *PBServer) prepare(peer int, args PrepareArgs, replies chan PrepareDone) ()
+{
+	reply := new(PrepareReply)
+	completed := srv.sendPrepare(peer, &args, reply)
+
+	prepareDone := &PrepareDone{View: reply.View, OpIndex: args.Index, Peer: peer, Success: true}
+
+	View int // the current view of the peer
+	OpIndex int // the op number that this is a succesful response to
+	Peer int // the index of the peer in the list of peers 
+	Success bool // whether the Prepare request has succeeded or failed
+
+	if !completed || !reply.Success {
+		log.Printf("Did not receive a reply from peer %v for prepare message %v", peer, *args)
+		prepareDone.Success = false
+	}
+
+	replies <- prepareOk
 }
 
 // exmple code to send an AppendEntries RPC to a server.
