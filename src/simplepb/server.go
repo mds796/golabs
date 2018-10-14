@@ -7,10 +7,11 @@ package simplepb
 //
 
 import (
-	"log"
-	"sync"
-	"math"
 	"labrpc"
+	"log"
+	"math"
+	"sync"
+	"containers/heap"
 )
 
 // the 3 possible server status
@@ -33,7 +34,8 @@ type PBServer struct {
 	commitIndex int           // all log entries <= commitIndex are considered to have been committed.
 
 	// ... other state that you might need ...
-	opIndex     int                          // The operation index in the log assigned to the most recently received request, initially 0.
+	opIndex                 int               // The operation index in the log assigned to the most recently received request, initially 0.
+	preparedOperations PrepareArgsQueue    // a priority queue of the operations to be added to the log
 }
 
 // Prepare defines the arguments for the Prepare RPC
@@ -50,14 +52,6 @@ type PrepareArgs struct {
 type PrepareReply struct {
 	View    int  // the backup's current view
 	Success bool // whether the Prepare request has been accepted or rejected
-}
-
-// A message signaling a successful response of a Prepare messge.
-type PrepareDone struct {
-	View int // the current view of the peer
-	OpIndex int // the op number that this is a succesful response to
-	Peer int // the index of the peer in the list of peers 
-	Success bool // whether the Prepare request has succeeded or failed
 }
 
 // RecoverArgs defined the arguments for the Recovery RPC
@@ -97,6 +91,11 @@ func GetPrimary(view int, nservers int) int {
 	return view % nservers
 }
 
+// True if this server is the primary for its current view, false otherwise.
+func (srv *PBServer) IsPrimary() bool {
+	return GetPrimary(srv.currentView, len(srv.peers)) == srv.me
+}
+
 // IsCommitted is called by tester to check whether an index position
 // has been considered committed by this server
 func (srv *PBServer) IsCommitted(index int) (committed bool) {
@@ -132,6 +131,7 @@ func (srv *PBServer) GetEntryAtIndex(index int) (ok bool, command interface{}) {
 // before moving on to the next test
 func (srv *PBServer) Kill() {
 	// Your code here, if necessary
+	close(preparedOperations)
 }
 
 // Make is called by tester to create and initalize a PBServer
@@ -145,7 +145,11 @@ func Make(peers []*labrpc.ClientEnd, me int, startingView int) *PBServer {
 		currentView:    startingView,
 		lastNormalView: startingView,
 		status:         NORMAL,
+		preparedOperations: make(PrepareArgsQueue)
 	}
+
+	heap.Init(&srv.preparedOperations)
+
 	// all servers' log are initialized with a dummy command at index 0
 	var v interface{}
 	srv.log = append(srv.log, v)
@@ -166,15 +170,14 @@ func Make(peers []*labrpc.ClientEnd, me int, startingView int) *PBServer {
 // *if it's eventually committed*. The second return value is the current
 // view. The third return value is true if this server believes it is
 // the primary.
-func (srv *PBServer) Start(command interface{}) (
-	index int, view int, ok bool) {
+func (srv *PBServer) Start(command interface{}) (index int, view int, ok bool) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 	// do not process command if status is not NORMAL
 	// and if i am not the primary in the current view
 	if srv.status != NORMAL {
 		return -1, srv.currentView, false
-	} else if GetPrimary(srv.currentView, len(srv.peers)) != srv.me {
+	} else if !srv.IsPrimary() {
 		return -1, srv.currentView, false
 	}
 
@@ -185,48 +188,21 @@ func (srv *PBServer) Start(command interface{}) (
 	srv.log = append(srv.log, command)
 
 	// Normally, we would update the client table with the new request number before sending Prepare messages.
+	arguments := &PrepareArgs{View: srv.currentView, PrimaryCommit: srv.commitIndex, Index: srv.opIndex, Entry: command}
+	go srv.primaryPrepare(arguments)
+	go srv.primaryLogCommand()
 
-	prepareOks := make(chan PrepareOk, len(srv.peers))
-
-	for peer := range srv.peers {
-		if peer != srv.me {
-			go srv.prepare(peer, PrepareArgs{View: srv.currentView, PrimaryCommit: srv.commitIndex, Index: srv.opIndex, Entry: command}, prepareOks)
-		}
-	}
-	
-	// TODO: await f PrepareOks
-
-	return srv.opIndex, view, ok
+	return srv.opIndex, srv.currentView, true
 }
 
 func (srv *PBServer) replicationFactor() int {
 	f := math.floor((len(srv.peers) - 1) / 2)
-	
+
 	if f <= 0 {
 		log.Fatalf("The replication factor f for the PBServer cannot be less than 1. %v <= 0", f)
 	}
 
 	return f
-}
-
-fun (srv *PBServer) prepare(peer int, args PrepareArgs, replies chan PrepareDone) ()
-{
-	reply := new(PrepareReply)
-	completed := srv.sendPrepare(peer, &args, reply)
-
-	prepareDone := &PrepareDone{View: reply.View, OpIndex: args.Index, Peer: peer, Success: true}
-
-	View int // the current view of the peer
-	OpIndex int // the op number that this is a succesful response to
-	Peer int // the index of the peer in the list of peers 
-	Success bool // whether the Prepare request has succeeded or failed
-
-	if !completed || !reply.Success {
-		log.Printf("Did not receive a reply from peer %v for prepare message %v", peer, *args)
-		prepareDone.Success = false
-	}
-
-	replies <- prepareOk
 }
 
 // exmple code to send an AppendEntries RPC to a server.
@@ -251,7 +227,9 @@ func (srv *PBServer) sendPrepare(server int, args *PrepareArgs, reply *PrepareRe
 
 // Prepare is the RPC handler for the Prepare RPC
 func (srv *PBServer) Prepare(args *PrepareArgs, reply *PrepareReply) {
-	// Your code here
+	if srv.status == NORMAL && !srv.IsPrimary() {
+		srv.backupPrepare()
+	}
 }
 
 // Recovery is the RPC handler for the Recovery RPC
