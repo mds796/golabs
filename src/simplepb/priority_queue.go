@@ -4,6 +4,7 @@ package simplepb
 type Prepare struct {
 	args  *PrepareArgs
 	reply *PrepareReply
+	done  chan bool
 }
 
 // OperationsQueue is a PriorityQueue that implements heap.Interface and holds *Prepare.
