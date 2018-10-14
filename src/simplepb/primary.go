@@ -2,7 +2,7 @@ package simplepb
 
 import (
 	"log"
-	"containers/heap"
+	"container/heap"
 )
 
 
