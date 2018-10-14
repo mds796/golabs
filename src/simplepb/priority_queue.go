@@ -1,7 +1,13 @@
 package simplepb
 
-// OperationsQueue is a PriorityQueue that implements heap.Interface and holds *PrepareArgs.
-type OperationsQueue []*PrepareArgs
+// Prepare is a pair of input and output used by the backup
+type Prepare struct {
+	args  *PrepareArgs
+	reply *PrepareReply
+}
+
+// OperationsQueue is a PriorityQueue that implements heap.Interface and holds *Prepare.
+type OperationsQueue []*Prepare
 
 // The length of the queue
 func (pq OperationsQueue) Len() int {
@@ -10,7 +16,7 @@ func (pq OperationsQueue) Len() int {
 
 // True if i is less than j
 func (pq OperationsQueue) Less(i, j int) bool {
-	return pq[i].Index < pq[j].Index
+	return pq[i].args.Index < pq[j].args.Index
 }
 
 // Swap the positions of i and j
@@ -20,7 +26,7 @@ func (pq OperationsQueue) Swap(i, j int) {
 
 // Push x unto the queue
 func (pq *OperationsQueue) Push(x interface{}) {
-	*pq = append(*pq, x.(*PrepareArgs))
+	*pq = append(*pq, x.(*Prepare))
 }
 
 // Pop the next operation to be committed from the queue
@@ -33,6 +39,6 @@ func (pq *OperationsQueue) Pop() interface{} {
 }
 
 // Peek at the next operation to be committed
-func (pq *OperationsQueue) Peek() *PrepareArgs {
+func (pq *OperationsQueue) Peek() *Prepare {
 	return (*pq)[0]
 }

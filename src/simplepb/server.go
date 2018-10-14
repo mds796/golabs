@@ -184,6 +184,7 @@ func (srv *PBServer) Start(command interface{}) (index int, view int, ok bool) {
 	srv.opIndex++
 	srv.log = append(srv.log, command)
 
+	log.Printf("Primary %v preparing operation %v for view %v, last commit is %v.", srv.me, srv.opIndex, srv.currentView, srv.commitIndex)
 	// Normally, we would update the client table with the new request number before sending Prepare messages.
 	arguments := &PrepareArgs{View: srv.currentView, PrimaryCommit: srv.commitIndex, Index: srv.opIndex, Entry: command}
 	go srv.primaryPrepare(arguments)
@@ -224,7 +225,7 @@ func (srv *PBServer) sendPrepare(server int, args *PrepareArgs, reply *PrepareRe
 // Prepare is the RPC handler for the Prepare RPC
 func (srv *PBServer) Prepare(args *PrepareArgs, reply *PrepareReply) {
 	if srv.status == NORMAL && !srv.IsPrimary() {
-		srv.backupPrepare()
+		srv.backupPrepare(args, reply)
 	}
 }
 

@@ -21,7 +21,7 @@ func (srv *PBServer) primarySendPrepare(peer int, arguments *PrepareArgs, replie
 	completed := srv.sendPrepare(peer, arguments, reply)
 
 	if !completed || !reply.Success {
-		log.Printf("Did not receive a reply from peer %v for prepare message %v", peer, *arguments)
+		log.Printf("Primary %v in view %v did not receive a reply from peer %v for operation %v (completed: %v, success: %v)", srv.me, srv.currentView, peer, arguments.Index, completed, reply.Success)
 		replies <- nil
 	} else {
 		replies <- reply
