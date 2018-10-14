@@ -181,7 +181,7 @@ func (srv *PBServer) Start(command interface{}) (index int, view int, ok bool) {
 	// Your code here
 	// Normally, we would check the client table to see if we have already serviced this request.
 	// However, we do not have a last request number and cannot add one to the Start function.
-	srv.opIndex += 1
+	srv.opIndex++
 	srv.log = append(srv.log, command)
 
 	// Normally, we would update the client table with the new request number before sending Prepare messages.
