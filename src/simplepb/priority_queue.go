@@ -1,26 +1,30 @@
 package simplepb
 
-// A PriorityQueue implements heap.Interface and holds PrepareArgs.
-type PrepareArgsQueue []*PrepareArgs
+// OperationsQueue is a PriorityQueue that implements heap.Interface and holds *PrepareArgs.
+type OperationsQueue []*PrepareArgs
 
-func (pq PrepareArgsQueue) Len() int {
+// The length of the queue
+func (pq OperationsQueue) Len() int {
 	return len(pq)
 }
 
-func (pq PrepareArgsQueue) Less(i, j int) bool {
+// True if i is less than j
+func (pq OperationsQueue) Less(i, j int) bool {
 	return pq[i].Index < pq[j].Index
 }
 
-func (pq PrepareArgsQueue) Swap(i, j int) {
+// Swap the positions of i and j
+func (pq OperationsQueue) Swap(i, j int) {
 	pq[i], pq[j] = pq[j], pq[i]
 }
 
-func (pq *PrepareArgsQueue) Push(x interface{}) {
-	n := len(*pq)
+// Push x unto the queue
+func (pq *OperationsQueue) Push(x interface{}) {
 	*pq = append(*pq, x.(*PrepareArgs))
 }
 
-func (pq *PrepareArgsQueue) Pop() interface{} {
+// Pop the next operation to be committed from the queue
+func (pq *OperationsQueue) Pop() interface{} {
 	old := *pq
 	n := len(old)
 	item := old[n-1]
@@ -28,6 +32,7 @@ func (pq *PrepareArgsQueue) Pop() interface{} {
 	return item
 }
 
-func (pq *PrepareArgsQueue) Peek() *PrepareArgs {
-	return &pq[0]
+// Peek at the next operation to be committed
+func (pq *OperationsQueue) Peek() *PrepareArgs {
+	return (*pq)[0]
 }

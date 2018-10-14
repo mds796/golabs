@@ -7,11 +7,10 @@ package simplepb
 //
 
 import (
+	"container/heap"
 	"labrpc"
 	"log"
-	"math"
 	"sync"
-	"containers/heap"
 )
 
 // the 3 possible server status
@@ -34,8 +33,8 @@ type PBServer struct {
 	commitIndex int           // all log entries <= commitIndex are considered to have been committed.
 
 	// ... other state that you might need ...
-	opIndex                 int               // The operation index in the log assigned to the most recently received request, initially 0.
-	preparedOperations PrepareArgsQueue    // a priority queue of the operations to be added to the log
+	opIndex               int             // The operation index in the log assigned to the most recently received request, initially 0.
+	uncommittedOperations OperationsQueue // a priority queue of the operations to be added to the log
 }
 
 // Prepare defines the arguments for the Prepare RPC
@@ -131,7 +130,6 @@ func (srv *PBServer) GetEntryAtIndex(index int) (ok bool, command interface{}) {
 // before moving on to the next test
 func (srv *PBServer) Kill() {
 	// Your code here, if necessary
-	close(preparedOperations)
 }
 
 // Make is called by tester to create and initalize a PBServer
@@ -140,15 +138,14 @@ func (srv *PBServer) Kill() {
 // startingView is the initial view (set to be zero) that all servers start in
 func Make(peers []*labrpc.ClientEnd, me int, startingView int) *PBServer {
 	srv := &PBServer{
-		peers:          peers,
-		me:             me,
-		currentView:    startingView,
-		lastNormalView: startingView,
-		status:         NORMAL,
-		preparedOperations: make(PrepareArgsQueue)
-	}
+		peers:                 peers,
+		me:                    me,
+		currentView:           startingView,
+		lastNormalView:        startingView,
+		status:                NORMAL,
+		uncommittedOperations: make(OperationsQueue, 0)}
 
-	heap.Init(&srv.preparedOperations)
+	heap.Init(&srv.uncommittedOperations)
 
 	// all servers' log are initialized with a dummy command at index 0
 	var v interface{}
@@ -190,13 +187,12 @@ func (srv *PBServer) Start(command interface{}) (index int, view int, ok bool) {
 	// Normally, we would update the client table with the new request number before sending Prepare messages.
 	arguments := &PrepareArgs{View: srv.currentView, PrimaryCommit: srv.commitIndex, Index: srv.opIndex, Entry: command}
 	go srv.primaryPrepare(arguments)
-	go srv.primaryLogCommand()
 
 	return srv.opIndex, srv.currentView, true
 }
 
 func (srv *PBServer) replicationFactor() int {
-	f := math.floor((len(srv.peers) - 1) / 2)
+	f := (len(srv.peers) - 1) / 2
 
 	if f <= 0 {
 		log.Fatalf("The replication factor f for the PBServer cannot be less than 1. %v <= 0", f)

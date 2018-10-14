@@ -1,7 +1,4 @@
 package simplepb
 
-
-func (srv *PBServer) backupPrepare()
-{
-
+func (srv *PBServer) backupPrepare() {
 }
