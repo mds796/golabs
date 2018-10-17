@@ -178,13 +178,11 @@ func (srv *PBServer) Start(command interface{}) (index int, view int, ok bool) {
 		return -1, srv.currentView, false
 	}
 
-	// Your code here
 	// Normally, we would check the client table to see if we have already serviced this request.
 	// However, we do not have a last request number and cannot add one to the Start function.
 	srv.opIndex++
 	srv.log = append(srv.log, command)
 
-	log.Printf("Primary %v preparing operation %v for view %v, last commit is %v.", srv.me, srv.opIndex, srv.currentView, srv.commitIndex)
 	// Normally, we would update the client table with the new request number before sending Prepare messages.
 	arguments := &PrepareArgs{View: srv.currentView, PrimaryCommit: srv.commitIndex, Index: srv.opIndex, Entry: command}
 	go srv.primaryPrepare(arguments)
@@ -229,9 +227,16 @@ func (srv *PBServer) Prepare(args *PrepareArgs, reply *PrepareReply) {
 	}
 }
 
+func (srv *PBServer) sendRecovery(server int, args *RecoveryArgs, reply *RecoveryReply) bool {
+	ok := srv.peers[server].Call("PBServer.Recovery", args, reply)
+	return ok
+}
+
 // Recovery is the RPC handler for the Recovery RPC
 func (srv *PBServer) Recovery(args *RecoveryArgs, reply *RecoveryReply) {
-	// Your code here
+	if srv.status == NORMAL && srv.IsPrimary() {
+		srv.primaryRecovery(args, reply)
+	}
 }
 
 // Some external oracle prompts the primary of the newView to
