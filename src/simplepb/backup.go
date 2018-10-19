@@ -3,6 +3,7 @@ package simplepb
 import (
 	"container/heap"
 	"log"
+	"time"
 )
 
 // Process prepare messages in the backup, doing state transfer if necessary.
@@ -15,25 +16,80 @@ func (srv *PBServer) backupPrepare(arguments *PrepareArgs, reply *PrepareReply) 
 
 	// Add the prepared operation to the min-heap for uncommitted ops
 	prepare := &Prepare{args: arguments, reply: reply, done: make(chan bool, 1)}
+	go srv.backupPrepareInOrder(prepare)
+	<-prepare.done
+}
 
-	if srv.isOutOfSync(prepare) {
-		recovery := make(chan bool)
-		go srv.backupRecover(prepare, recovery)
-		<-recovery
-	} else {
-		go srv.backupPrepareInOrder(prepare)
-		<-prepare.done
+// Prepares the next set of operations that are in order from the current opIndex
+// Does nothing if the next operation is not in the PrepareQueue.
+// For example, if we had operations [2, 4, 5] and we just received a request to prepare #1,
+// We would process ops 1 and 2, but not 4 and 5. Once we receive the message to prepare 3,
+// only then would we prepare 3, 4, and 5 in order.
+// Notice that this may cause the primary to timeout waiting for a response, but that's okay.
+func (srv *PBServer) backupPrepareInOrder(prepare *Prepare) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	log.Printf("Replica %v - Preparing (view: %v op: %v commit: %v entry: %v)", srv.me, prepare.args.View, prepare.args.Index, prepare.args.PrimaryCommit, prepare.args.Entry)
+
+	// Set recovery timer if primary does not reply in a timely fashion
+	timer := time.AfterFunc(2 * time.Second, srv.executeRecovery)
+
+	heap.Push(&srv.uncommittedOperations, prepare)
+	srv.executeUncommittedOperations()
+
+	// Disable recovery timer if we managed to process all operations in the queue
+	if srv.uncommittedOperations.Len() == 0 {
+		timer.Stop()
 	}
 }
 
-func (srv *PBServer) isOutOfSync(prepare *Prepare) bool {
-	return prepare.args.PrimaryCommit > srv.opIndex
+func (srv *PBServer) executeUncommittedOperations() {
+	// If the next operation in the uncommitted ops queue is the next to be committed,
+	// then commit the operations until you reach an operation that is out of order
+	//
+	// Otherwise, it waits for the next operations. If the next operation finally arrives,
+	// we process it and all the following ones.
+	//
+	// In case the next operation does not arrive in a timely fashion, we consider
+	// the message to be lost. In this case, the recovery timer will fire and execute
+	// the recovery protocol.
+	for srv.uncommittedOperations.Len() > 0 && srv.isNextOperation(srv.uncommittedOperations.Peek()) {
+		message := heap.Pop(&srv.uncommittedOperations).(*Prepare)
+
+		srv.opIndex = message.args.Index
+		srv.log = append(srv.log, message.args.Entry)
+
+		if message.args.PrimaryCommit > srv.commitIndex {
+			srv.commitIndex = message.args.PrimaryCommit
+			srv.timeLastCommit = time.Now()
+		}
+
+		message.reply.Success = srv.currentView == message.args.View && srv.opIndex >= message.args.Index
+		message.reply.View = srv.currentView
+		message.done <- true
+
+		log.Printf("Replica %v - Prepared (view: %v op: %v commit: %v entry: %v)", srv.me, message.args.View, message.args.Index, message.args.PrimaryCommit, message.args.Entry)
+	}
+}
+
+func (srv *PBServer) isNextOperation(prepare *Prepare) bool {
+	return prepare.args.Index == (srv.opIndex + 1)
+}
+
+func (srv *PBServer) executeRecovery() {
+	// Only go into recovery if it wasn't in recovery yet
+	// Also, verify the time of the last commit update, since a timer might have been set
+	// right after recovery finished
+	if (srv.status == NORMAL && time.Since(srv.timeLastCommit).Seconds() > 2) {
+		srv.backupRecover()
+	}
 }
 
 // Transfer state from primary to backup.
 // Change replica state to RECOVERING, send recovery requests, and update log,
 // op index and commit index.
-func (srv *PBServer) backupRecover(prepare *Prepare, recovery chan bool) {
+func (srv *PBServer) backupRecover() {
 	log.Printf("Replica %v - Recovering (view: %v op: %v commit: %v)", srv.me, srv.currentView, srv.opIndex, srv.commitIndex)
 
 	srv.status = RECOVERING
@@ -49,11 +105,21 @@ func (srv *PBServer) backupRecover(prepare *Prepare, recovery chan bool) {
 		}
 	}
 
+	// Process recovery requests
 	go srv.backupAwaitRecovery(arguments, replies, done)
 	<-done
 
+	srv.status = NORMAL
+
+	// Reply to uncommitted operations that were recovered
+	for srv.uncommittedOperations.Len() > 0 && srv.uncommittedOperations.Peek().args.Index <= srv.opIndex {
+		message := heap.Pop(&srv.uncommittedOperations).(*Prepare)
+		message.reply.Success = srv.currentView == message.args.View && srv.opIndex >= message.args.Index
+		message.reply.View = srv.currentView
+		message.done <- true
+	}
+
 	log.Printf("Replica %v - Recovered (view %v op: %v commit: %v)", srv.me, srv.currentView, srv.opIndex, srv.commitIndex)
-	recovery<- true
 }
 
 func (srv *PBServer) backupSendRecovery(peer int, arguments *RecoveryArgs, replies chan *RecoveryReply) {
@@ -86,59 +152,8 @@ func (srv *PBServer) backupAwaitRecovery(arguments *RecoveryArgs, replies chan *
 		}
 
 		srv.commitIndex = reply.PrimaryCommit
-		srv.status = NORMAL
+		srv.timeLastCommit = time.Now()
 	}
 
 	done<- true
-}
-
-// Prepares the next set of operations that are in order from the current opIndex
-// Does nothing if the next operation is not in the PrepareQueue.
-// For example, if we had operations [2, 4, 5] and we just received a request to prepare #1,
-// We would process ops 1 and 2, but not 4 and 5. Once we receive the message to prepare 3,
-// only then would we prepare 3, 4, and 5 in order.
-// Notice that this may cause the primary to timeout waiting for a response, but that's okay.
-func (srv *PBServer) backupPrepareInOrder(prepare *Prepare) {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-
-	log.Printf("Replica %v - Preparing (view: %v op: %v commit: %v entry: %v)", srv.me, prepare.args.View, prepare.args.Index, prepare.args.PrimaryCommit, prepare.args.Entry)
-	// heap.Push(&srv.uncommittedOperations, prepare)
-
-	if prepare.args.Index > srv.opIndex && prepare.args.PrimaryCommit >= srv.commitIndex {
-		heap.Push(&srv.uncommittedOperations, prepare)
-	} else {
-		log.Printf("Replica %v - Ignoring prepare (view: %v op: %v commit: %v entry: %v)", srv.me, prepare.args.View, prepare.args.Index, prepare.args.PrimaryCommit, prepare.args.Entry)
-	}
-
-	// If the next operation in the uncommitted ops queue is the next to be committed,
-	// then commit the operations until you reach an operation that is out of order
-	for srv.uncommittedOperations.Len() > 0 && srv.isNextOperation(srv.uncommittedOperations.Peek()) {
-		enqueuedPrepare := heap.Pop(&srv.uncommittedOperations).(*Prepare)
-
-		if enqueuedPrepare.args.Index <= srv.opIndex || enqueuedPrepare.args.PrimaryCommit < srv.commitIndex {
-			continue
-		}
-
-		if enqueuedPrepare.args.Index > srv.opIndex {
-			srv.opIndex = enqueuedPrepare.args.Index
-		}
-
-		if enqueuedPrepare.args.PrimaryCommit > srv.commitIndex {
-			srv.commitIndex = enqueuedPrepare.args.PrimaryCommit
-		}
-
-		enqueuedPrepare.reply.Success = srv.currentView == enqueuedPrepare.args.View && srv.opIndex >= enqueuedPrepare.args.Index
-		enqueuedPrepare.reply.View = srv.currentView
-
-		srv.log = append(srv.log, enqueuedPrepare.args.Entry)
-
-		enqueuedPrepare.done <- true
-
-		log.Printf("Replica %v - Prepared (view: %v op: %v commit: %v entry: %v)", srv.me, enqueuedPrepare.args.View, enqueuedPrepare.args.Index, enqueuedPrepare.args.PrimaryCommit, enqueuedPrepare.args.Entry)
-	}
-}
-
-func (srv *PBServer) isNextOperation(prepare *Prepare) bool {
-	return prepare.args.Index == (srv.opIndex + 1)
 }
