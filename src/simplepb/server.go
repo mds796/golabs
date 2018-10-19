@@ -40,7 +40,7 @@ type PBServer struct {
 	// ... other state that you might need ...
 	opIndex               int             // The operation index in the log assigned to the most recently received request, initially 0.
 	uncommittedOperations OperationsQueue // a priority queue of the operations to be added to the log
-	timeLastCommit time.Time			// The last time a backup updated its commit index
+	timeLastCommit        time.Time       // The last time a backup updated its commit index
 }
 
 // Prepare defines the arguments for the Prepare RPC
@@ -150,7 +150,7 @@ func Make(peers []*labrpc.ClientEnd, me int, startingView int) *PBServer {
 		lastNormalView:        startingView,
 		status:                NORMAL,
 		uncommittedOperations: make(OperationsQueue, 0),
-		timeLastCommit: time.Now(),
+		timeLastCommit:        time.Now(),
 	}
 
 	heap.Init(&srv.uncommittedOperations)

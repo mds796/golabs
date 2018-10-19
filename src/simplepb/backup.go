@@ -33,7 +33,7 @@ func (srv *PBServer) backupPrepareInOrder(prepare *Prepare) {
 	log.Printf("Replica %v - Preparing (view: %v op: %v commit: %v entry: %v)", srv.me, prepare.args.View, prepare.args.Index, prepare.args.PrimaryCommit, prepare.args.Entry)
 
 	// Set recovery timer if primary does not reply in a timely fashion
-	timer := time.AfterFunc(2 * time.Second, srv.executeRecovery)
+	timer := time.AfterFunc(2*time.Second, srv.executeRecovery)
 
 	heap.Push(&srv.uncommittedOperations, prepare)
 	srv.executeUncommittedOperations()
@@ -81,7 +81,7 @@ func (srv *PBServer) executeRecovery() {
 	// Only go into recovery if it wasn't in recovery yet
 	// Also, verify the time of the last commit update, since a timer might have been set
 	// right after recovery finished
-	if (srv.status == NORMAL && time.Since(srv.timeLastCommit).Seconds() > 2) {
+	if srv.status == NORMAL && time.Since(srv.timeLastCommit).Seconds() > 2 {
 		srv.backupRecover()
 	}
 }
@@ -127,9 +127,9 @@ func (srv *PBServer) backupSendRecovery(peer int, arguments *RecoveryArgs, repli
 	completed := srv.sendRecovery(peer, arguments, reply)
 
 	if !completed || !reply.Success {
-		replies<- nil
+		replies <- nil
 	} else {
-		replies<- reply
+		replies <- reply
 	}
 }
 
@@ -155,5 +155,5 @@ func (srv *PBServer) backupAwaitRecovery(arguments *RecoveryArgs, replies chan *
 		srv.timeLastCommit = time.Now()
 	}
 
-	done<- true
+	done <- true
 }
