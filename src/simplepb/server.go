@@ -198,21 +198,7 @@ func (srv *PBServer) Start(command interface{}) (index int, view int, ok bool) {
 	// Normally, we would check the client table to see if we have already serviced this request.
 	// However, we do not have a last request number and cannot add one to the Start function.
 	srv.appendCommand(command)
-
-	// Normally, we would update the client table with the new request number before sending Prepare messages.
-	arguments := &PrepareArgs{View: srv.currentView, PrimaryCommit: srv.commitIndex, Index: srv.opIndex, Entry: command}
-
-	log.Printf("Primary %v - Preparing (view: %v op: %v commit: %v entry: %v)", srv.me, srv.currentView, arguments.Index, srv.commitIndex, arguments.Entry)
-
-	replies := make(chan *PrepareReply, len(srv.peers))
-
-	for peer := range srv.peers {
-		if peer != srv.me {
-			go srv.primarySendPrepare(peer, arguments, replies)
-		}
-	}
-
-	go srv.primaryAwaitPrepare(arguments, replies)
+	go srv.primaryPrepare(srv.opIndex)
 
 	return srv.opIndex, srv.currentView, true
 }
@@ -265,9 +251,6 @@ func (srv *PBServer) sendRecovery(server int, args *RecoveryArgs, reply *Recover
 
 // Recovery is the RPC handler for the Recovery RPC
 func (srv *PBServer) Recovery(args *RecoveryArgs, reply *RecoveryReply) {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-
 	reply.View = srv.currentView
 	reply.Success = srv.isNormalPrimary() && args.View <= srv.currentView
 

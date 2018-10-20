@@ -47,7 +47,7 @@ func (srv *PBServer) backupPrepareInOrder(prepare *Prepare) {
 	// Only go into recovery if it wasn't in recovery yet
 	// Also, verify the time of the last commit update, since a timer might have been set
 	// right after recovery finished
-	if prepare.args.View > srv.currentView || time.Since(srv.timeLastCommit).Nanoseconds() > srv.noCommitThreshold.Nanoseconds() {
+	if prepare.args.View > srv.currentView {
 		go srv.backupRecover(prepare)
 		return
 	}
@@ -64,6 +64,10 @@ func (srv *PBServer) backupPrepareInOrder(prepare *Prepare) {
 }
 
 func (srv *PBServer) backupRecover(prepare *Prepare) {
+	if prepare.args.View <= srv.currentView && time.Since(srv.timeLastCommit).Nanoseconds() < srv.noCommitThreshold.Nanoseconds() {
+		return
+	}
+
 	srv.recover()
 	srv.backupPrepareInOrder(prepare)
 }
@@ -78,7 +82,6 @@ func (srv *PBServer) executeUncommittedOperations() {
 	// In case the next operation does not arrive in a timely fashion, we consider
 	// the message to be lost. In this case, the recovery timer will fire and execute
 	// the recovery protocol.
-
 	for srv.uncommittedOperations.Len() > 0 && srv.isNextOperation(srv.uncommittedOperations.Peek()) {
 		message := heap.Pop(&srv.uncommittedOperations).(*Prepare)
 

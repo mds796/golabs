@@ -7,8 +7,6 @@ import (
 
 func (srv *PBServer) recover() {
 	arguments, replies := srv.startRecovery()
-
-	// Process recovery requests
 	srv.awaitRecovery(arguments, replies)
 
 	log.Printf("Node %v - Recovered (view %v op: %v commit: %v)", srv.me, srv.currentView, srv.opIndex, srv.commitIndex)
@@ -70,7 +68,9 @@ func (srv *PBServer) awaitRecovery(arguments *RecoveryArgs, replies chan *Recove
 	}
 
 	if success >= srv.replicationFactor() && primary != nil {
-		log.Printf("Node %v - recovered with commit index %d and op index %d.\n", srv.me, srv.commitIndex, srv.opIndex)
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
+
 		for i := len(srv.log); i < len(primary.Entries); i++ {
 			srv.appendCommand(primary.Entries[i])
 		}
@@ -80,8 +80,9 @@ func (srv *PBServer) awaitRecovery(arguments *RecoveryArgs, replies chan *Recove
 		srv.timeLastCommit = time.Now()
 		srv.status = NORMAL
 		srv.lastNormalView = srv.currentView
+
+		log.Printf("Node %v - recovered with commit index %d and op index %d.\n", srv.me, srv.commitIndex, srv.opIndex)
 	} else {
-		log.Printf("Node %v - Did not received any recovery reply", srv.me)
-		panic("Replica recovery failed")
+		log.Printf("Node %v - Did not received sufficient recovery replies (%d) or primary did not reply (%v)", srv.me, success, primary == nil)
 	}
 }
