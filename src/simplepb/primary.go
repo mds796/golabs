@@ -4,7 +4,18 @@ import (
 	"log"
 )
 
+func (srv *PBServer) canPrepare() bool {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	return srv.status == NORMAL && srv.IsPrimary()
+}
+
 func (srv *PBServer) primaryPrepare(arguments *PrepareArgs) {
+	if !srv.canPrepare() {
+		return
+	}
+
 	log.Printf("Primary %v - Preparing (view: %v op: %v commit: %v entry: %v)", srv.me, srv.currentView, arguments.Index, srv.commitIndex, arguments.Entry)
 
 	replies := make(chan *PrepareReply, len(srv.peers))
@@ -52,6 +63,8 @@ func (srv *PBServer) primaryAwaitPrepare(arguments *PrepareArgs, replies chan *P
 		}
 
 		if reply != nil && reply.View > srv.currentView {
+			log.Printf("Primary %v - received prepare reply with larger view %d (view: %v op: %v commit: %v entry: %v)", srv.me, reply.View, srv.currentView, arguments.Index, srv.commitIndex, arguments.Entry)
+
 			srv.backupRecover()
 			break
 		}

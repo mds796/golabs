@@ -143,7 +143,7 @@ func (srv *PBServer) backupSendRecovery(peer int, arguments *RecoveryArgs, repli
 	reply := new(RecoveryReply)
 	completed := srv.sendRecovery(peer, arguments, reply)
 
-	if !completed || !reply.Success {
+	if !completed {
 		replies <- nil
 	} else {
 		replies <- reply
@@ -168,6 +168,7 @@ func (srv *PBServer) backupAwaitRecovery(arguments *RecoveryArgs, replies chan *
 			srv.opIndex++
 		}
 
+		srv.currentView = reply.View
 		srv.commitIndex = reply.PrimaryCommit
 		srv.timeLastCommit = time.Now()
 	}

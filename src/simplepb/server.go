@@ -388,7 +388,7 @@ func (srv *PBServer) ViewChange(args *ViewChangeArgs, reply *ViewChangeReply) {
 		srv.status = VIEWCHANGE
 	}
 
-	log.Printf("node-%d received ViewChange for view %d with status %v.\n", srv.me, srv.currentView, srv.status)
+	log.Printf("node-%d received ViewChange for view %d with status %v.\n", srv.me, args.View, srv.status)
 }
 
 // StartView is the RPC handler to process StartView RPC.
