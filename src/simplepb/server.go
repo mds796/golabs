@@ -186,26 +186,29 @@ func Make(peers []*labrpc.ClientEnd, me int, startingView int) *PBServer {
 // view. The third return value is true if this server believes it is
 // the primary.
 func (srv *PBServer) Start(command interface{}) (index int, view int, ok bool) {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
 	// do not process command if status is not NORMAL
 	// and if i am not the primary in the current view
-	if srv.status != NORMAL {
-		return -1, srv.currentView, false
-	} else if !srv.IsPrimary() {
+	if !srv.canPrepare() {
 		return -1, srv.currentView, false
 	}
 
 	// Normally, we would check the client table to see if we have already serviced this request.
 	// However, we do not have a last request number and cannot add one to the Start function.
-	srv.opIndex++
-	srv.log = append(srv.log, command)
+	srv.appendCommand(command)
 
 	// Normally, we would update the client table with the new request number before sending Prepare messages.
 	arguments := &PrepareArgs{View: srv.currentView, PrimaryCommit: srv.commitIndex, Index: srv.opIndex, Entry: command}
 	go srv.primaryPrepare(arguments)
 
 	return srv.opIndex, srv.currentView, true
+}
+
+func (srv *PBServer) appendCommand(command interface{}) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	srv.opIndex++
+	srv.log = append(srv.log, command)
 }
 
 func (srv *PBServer) replicationFactor() int {

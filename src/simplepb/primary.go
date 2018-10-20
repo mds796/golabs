@@ -60,7 +60,7 @@ func (srv *PBServer) primaryAwaitPrepare(arguments *PrepareArgs, replies chan *P
 		}
 
 		if reply != nil && reply.View > srv.currentView {
-			log.Printf("Primary %v - received prepare reply with larger view %d (view: %v op: %v commit: %v entry: %v)", srv.me, reply.View, srv.currentView, arguments.Index, srv.commitIndex, arguments.Entry)
+			log.Printf("Primary %v - received prepare reply with larger view %d (view: %v op: %v commit: %v entry: %v, status: %d)", srv.me, reply.View, srv.currentView, arguments.Index, srv.commitIndex, arguments.Entry, srv.status)
 			srv.recoverCrashedPrimary()
 			break
 		}
@@ -71,8 +71,8 @@ func (srv *PBServer) primaryAwaitPrepare(arguments *PrepareArgs, replies chan *P
 			log.Printf("Primary %v - Updating commit %v -> %v", srv.me, srv.commitIndex, arguments.Index)
 
 			srv.mu.Lock()
-			defer srv.mu.Unlock()
 			srv.commitIndex = arguments.Index
+			srv.mu.Unlock()
 		}
 	} else {
 		log.Printf("Primary %v - Failed serving operation %v", srv.me, arguments.Index)
@@ -80,6 +80,9 @@ func (srv *PBServer) primaryAwaitPrepare(arguments *PrepareArgs, replies chan *P
 }
 
 func (srv *PBServer) primaryRecovery(arguments *RecoveryArgs, reply *RecoveryReply) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
 	reply.View = srv.currentView
 	reply.Entries = srv.log
 	reply.PrimaryCommit = srv.commitIndex
