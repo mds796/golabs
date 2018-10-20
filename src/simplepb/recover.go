@@ -8,8 +8,6 @@ import (
 func (srv *PBServer) recover() {
 	arguments, replies := srv.startRecovery()
 	srv.awaitRecovery(arguments, replies)
-
-	log.Printf("Node %v - Recovered (view %v op: %v commit: %v)", srv.me, srv.currentView, srv.opIndex, srv.commitIndex)
 }
 
 func (srv *PBServer) startRecovery() (arguments *RecoveryArgs, replies chan *RecoveryReply) {

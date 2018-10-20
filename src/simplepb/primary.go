@@ -30,7 +30,6 @@ func (srv *PBServer) primarySendPrepare(peer int, arguments *PrepareArgs, replie
 	completed := srv.sendPrepare(peer, arguments, reply)
 
 	if !completed {
-		log.Printf("Primary %v - Did not receive prepare reply from replica %v (view: %v op: %v commit: %v entry: %v)", srv.me, peer, srv.currentView, arguments.Index, srv.commitIndex, arguments.Entry)
 		replies <- nil
 	} else {
 		replies <- reply
@@ -54,22 +53,17 @@ func (srv *PBServer) primaryAwaitPrepare(arguments *PrepareArgs, replies chan *P
 		} else {
 			success++
 		}
-
-		if reply != nil && reply.View > srv.currentView {
-			log.Printf("Primary %v - received prepare reply with larger view %d (view: %v op: %v commit: %v entry: %v, status: %d)", srv.me, reply.View, srv.currentView, arguments.Index, srv.commitIndex, arguments.Entry, srv.status)
-			go srv.recover()
-			return
-		}
 	}
 
 	if success >= majority {
-		if srv.commitIndex < arguments.Index {
-			srv.mu.Lock()
-			defer srv.mu.Unlock()
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
+
+		if srv.commitIndex < arguments.Index && srv.isNormalPrimary() {
 			log.Printf("Primary %v - Updating commit %v -> %v", srv.me, srv.commitIndex, arguments.Index)
 			srv.commitIndex = arguments.Index
 		}
-	} else {
+	} else if !srv.isNormalPrimary() {
 		log.Printf("Primary %v - Failed serving operation %v", srv.me, arguments.Index)
 	}
 }

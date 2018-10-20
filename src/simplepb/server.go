@@ -112,12 +112,7 @@ func (srv *PBServer) IsPrimary() bool {
 // IsCommitted is called by tester to check whether an index position
 // has been considered committed by this server
 func (srv *PBServer) IsCommitted(index int) (committed bool) {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	if srv.commitIndex >= index {
-		return true
-	}
-	return false
+	return srv.commitIndex >= index
 }
 
 // ViewStatus is called by tester to find out the current view of this server
@@ -257,6 +252,8 @@ func (srv *PBServer) Recovery(args *RecoveryArgs, reply *RecoveryReply) {
 	if reply.Success {
 		reply.PrimaryCommit = srv.commitIndex
 		reply.Entries = srv.log
+
+		go srv.primaryPrepare(srv.opIndex)
 	}
 
 	log.Printf("Node %d received recover request in view %d from %d", srv.me, srv.currentView, args.Server)
@@ -286,24 +283,18 @@ func (srv *PBServer) PromptViewChange(newView int) {
 	// wait to receive ViewChange replies
 	// if view change succeeds, send StartView RPC
 	go func() {
-		majority := srv.replicationFactor()
-
 		successReplies := make([]*ViewChangeReply, 0, len(srv.peers))
 		success := 0
 		failure := 0
 
-		for i := 1; success < majority && i < len(srv.peers); i++ {
+		for i := 1; i < len(srv.peers); i++ {
 			r := <-vcReplyChan
 
-			if r != nil {
+			if r == nil {
+				failure++
+			} else {
 				success++
 				successReplies = append(successReplies, r)
-			} else {
-				failure++
-			}
-
-			if (success+failure == len(srv.peers)) || success >= majority {
-				break
 			}
 		}
 
@@ -322,6 +313,7 @@ func (srv *PBServer) PromptViewChange(newView int) {
 			Log:         newLog,
 			CommitIndex: srv.commitIndex,
 		}
+
 		// send StartView to all servers including myself
 		for i := 0; i < len(srv.peers); i++ {
 			var reply StartViewReply
@@ -377,20 +369,19 @@ func (srv *PBServer) determineNewViewLog(successReplies []*ViewChangeReply) (ok 
 
 // ViewChange is the RPC handler to process ViewChange RPC.
 func (srv *PBServer) ViewChange(args *ViewChangeArgs, reply *ViewChangeReply) {
-	// Your code here
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
 
 	reply.LastNormalView = srv.lastNormalView
 	reply.Log = srv.log
 	reply.CommitIndex = srv.commitIndex
 	reply.Success = args.View > srv.currentView
 
+	log.Printf("node-%d received ViewChange for view %d with status %v, and log %v.\n", srv.me, args.View, srv.status, srv.log)
+
 	if reply.Success {
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
 		srv.status = VIEWCHANGE
 	}
-
-	log.Printf("node-%d received ViewChange for view %d with status %v.\n", srv.me, args.View, srv.status)
 }
 
 // StartView is the RPC handler to process StartView RPC.

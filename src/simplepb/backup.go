@@ -14,7 +14,7 @@ import (
 func (srv *PBServer) backupPrepare(arguments *PrepareArgs, reply *PrepareReply) {
 	srv.prepareReply(arguments, reply)
 
-	if reply.Success {
+	if arguments.View > srv.currentView || (reply.Success && arguments.Index > srv.opIndex) {
 		// Add the prepared operation to the min-heap for uncommitted ops
 		prepare := &Prepare{args: arguments, reply: reply, done: make(chan bool, 1)}
 		go srv.backupPrepareInOrder(prepare)
@@ -23,13 +23,18 @@ func (srv *PBServer) backupPrepare(arguments *PrepareArgs, reply *PrepareReply) 
 }
 
 func (srv *PBServer) prepareReply(arguments *PrepareArgs, reply *PrepareReply) {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-
 	log.Printf("Node %v - [view %v commit %v op %v] - Received prepare (view: %v op: %v commit: %v entry: %v)", srv.me, srv.currentView, srv.commitIndex, srv.opIndex, srv.currentView, arguments.Index, arguments.PrimaryCommit, arguments.Entry)
 
 	reply.View = srv.currentView
 	reply.Success = srv.status == NORMAL && !srv.IsPrimary() && arguments.View >= srv.currentView
+
+	if arguments.PrimaryCommit > srv.commitIndex {
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
+
+		srv.commitIndex = arguments.PrimaryCommit
+		srv.timeLastCommit = time.Now()
+	}
 }
 
 // Prepares the next set of operations that are in order from the current opIndex
@@ -88,11 +93,6 @@ func (srv *PBServer) executeUncommittedOperations() {
 		if message.args.Index > srv.opIndex {
 			srv.opIndex = message.args.Index
 			srv.log = append(srv.log, message.args.Entry)
-		}
-
-		if message.args.PrimaryCommit > srv.commitIndex {
-			srv.commitIndex = message.args.PrimaryCommit
-			srv.timeLastCommit = time.Now()
 		}
 
 		message.reply.Success = srv.currentView == message.args.View && srv.opIndex >= message.args.Index
