@@ -48,9 +48,6 @@ func (srv *PBServer) primaryAwaitPrepare(arguments *PrepareArgs, replies chan *P
 	success := 0
 	failure := 0
 
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-
 	// index starts at 1 in order to skip the primary.
 	// stops immediately after f successes
 	for i := 1; success < majority && i < len(srv.peers); i++ {
@@ -64,8 +61,7 @@ func (srv *PBServer) primaryAwaitPrepare(arguments *PrepareArgs, replies chan *P
 
 		if reply != nil && reply.View > srv.currentView {
 			log.Printf("Primary %v - received prepare reply with larger view %d (view: %v op: %v commit: %v entry: %v)", srv.me, reply.View, srv.currentView, arguments.Index, srv.commitIndex, arguments.Entry)
-
-			srv.backupRecover()
+			srv.recoverCrashedPrimary()
 			break
 		}
 	}
@@ -73,6 +69,9 @@ func (srv *PBServer) primaryAwaitPrepare(arguments *PrepareArgs, replies chan *P
 	if success >= majority {
 		if srv.commitIndex < arguments.Index {
 			log.Printf("Primary %v - Updating commit %v -> %v", srv.me, srv.commitIndex, arguments.Index)
+
+			srv.mu.Lock()
+			defer srv.mu.Unlock()
 			srv.commitIndex = arguments.Index
 		}
 	} else {
@@ -85,4 +84,11 @@ func (srv *PBServer) primaryRecovery(arguments *RecoveryArgs, reply *RecoveryRep
 	reply.Entries = srv.log
 	reply.PrimaryCommit = srv.commitIndex
 	reply.Success = true
+}
+
+func (srv *PBServer) recoverCrashedPrimary() {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	srv.backupRecover()
 }

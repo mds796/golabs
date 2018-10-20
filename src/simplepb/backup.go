@@ -143,7 +143,7 @@ func (srv *PBServer) backupSendRecovery(peer int, arguments *RecoveryArgs, repli
 	reply := new(RecoveryReply)
 	completed := srv.sendRecovery(peer, arguments, reply)
 
-	if !completed {
+	if !completed || !reply.Success {
 		replies <- nil
 	} else {
 		replies <- reply
