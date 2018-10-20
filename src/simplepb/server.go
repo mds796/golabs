@@ -41,7 +41,7 @@ type PBServer struct {
 	opIndex               int             // The operation index in the log assigned to the most recently received request, initially 0.
 	uncommittedOperations OperationsQueue // a priority queue of the operations to be added to the log
 	timeLastCommit        time.Time       // The last time a backup updated its commit index
-	noCommitThreshold     int             // The amount of time until not hearing from the primary is grounds for recovery or a view change
+	noCommitThreshold     time.Duration   // The amount of time until not hearing from the primary is grounds for recovery or a view change
 }
 
 // PrepareArgs defines the arguments for the Prepare RPC
@@ -83,13 +83,15 @@ type ViewChangeArgs struct {
 type ViewChangeReply struct {
 	LastNormalView int           // the latest view which had a NORMAL status at the server
 	Log            []interface{} // the log at the server
+	CommitIndex    int           // Last commit index
 	Success        bool          // whether the ViewChange request has been accepted/rejected
 }
 
 // StartViewArgs defines the arguments for the StartView RPC
 type StartViewArgs struct {
-	View int           // the new view which has completed view-change
-	Log  []interface{} // the log associated with the new new
+	View        int           // the new view which has completed view-change
+	Log         []interface{} // the log associated with the new new
+	CommitIndex int           // Last commit index
 }
 
 // StartViewReply defines the reply for the StartView RPC
@@ -123,6 +125,7 @@ func (srv *PBServer) IsCommitted(index int) (committed bool) {
 func (srv *PBServer) ViewStatus() (currentView int, statusIsNormal bool) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
+
 	return srv.currentView, srv.status == NORMAL
 }
 
@@ -157,6 +160,7 @@ func Make(peers []*labrpc.ClientEnd, me int, startingView int) *PBServer {
 		status:                NORMAL,
 		uncommittedOperations: make(OperationsQueue, 0),
 		timeLastCommit:        time.Now(),
+		noCommitThreshold:     2 * time.Second,
 	}
 
 	heap.Init(&srv.uncommittedOperations)
@@ -205,6 +209,9 @@ func (srv *PBServer) Start(command interface{}) (index int, view int, ok bool) {
 }
 
 func (srv *PBServer) replicationFactor() int {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
 	f := (len(srv.peers) - 1) / 2
 
 	if f <= 0 {
@@ -260,6 +267,7 @@ func (srv *PBServer) Recovery(args *RecoveryArgs, reply *RecoveryReply) {
 func (srv *PBServer) PromptViewChange(newView int) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
+
 	newPrimary := GetPrimary(newView, len(srv.peers))
 
 	if newPrimary != srv.me { //only primary of newView should do view change
@@ -267,74 +275,136 @@ func (srv *PBServer) PromptViewChange(newView int) {
 	} else if newView <= srv.currentView {
 		return
 	}
-	vcArgs := &ViewChangeArgs{
-		View: newView,
-	}
+
+	vcArgs := &ViewChangeArgs{View: newView}
 	vcReplyChan := make(chan *ViewChangeReply, len(srv.peers))
-	// send ViewChange to all servers including myself
-	for i := 0; i < len(srv.peers); i++ {
-		go func(server int) {
-			var reply ViewChangeReply
-			ok := srv.peers[server].Call("PBServer.ViewChange", vcArgs, &reply)
-			// fmt.Printf("node-%d (nReplies %d) received reply ok=%v reply=%v\n", srv.me, nReplies, ok, r.reply)
-			if ok {
-				vcReplyChan <- &reply
-			} else {
-				vcReplyChan <- nil
-			}
-		}(i)
-	}
+
+	srv.sendViewChange(vcArgs, vcReplyChan)
 
 	// wait to receive ViewChange replies
 	// if view change succeeds, send StartView RPC
 	go func() {
-		var successReplies []*ViewChangeReply
-		var nReplies int
-		majority := len(srv.peers)/2 + 1
-		for r := range vcReplyChan {
-			nReplies++
-			if r != nil && r.Success {
+		majority := srv.replicationFactor()
+
+		successReplies := make([]*ViewChangeReply, 0, len(srv.peers))
+		success := 0
+		failure := 0
+
+		for i := 1; success < majority && i < len(srv.peers); i++ {
+			r := <-vcReplyChan
+
+			if r != nil {
+				success++
 				successReplies = append(successReplies, r)
+			} else {
+				failure++
 			}
-			if nReplies == len(srv.peers) || len(successReplies) == majority {
+
+			if (success+failure == len(srv.peers)) || success >= majority {
 				break
 			}
 		}
-		ok, log := srv.determineNewViewLog(successReplies)
+
+		log.Println("Received ViewChange replies from a majority of the replicas.")
+
+		ok, newLog, newCommitIndex := srv.determineNewViewLog(successReplies)
 		if !ok {
+			log.Printf("Unable to determine the log for the new view. Received %v replies, needed %v.", len(successReplies), srv.replicationFactor())
 			return
 		}
+
+		log.Printf("Determine %d as the log for the new view %d with commit index %d.", newLog, newView, newCommitIndex)
+
 		svArgs := &StartViewArgs{
-			View: vcArgs.View,
-			Log:  log,
+			View:        vcArgs.View,
+			Log:         newLog,
+			CommitIndex: srv.commitIndex,
 		}
 		// send StartView to all servers including myself
 		for i := 0; i < len(srv.peers); i++ {
 			var reply StartViewReply
 			go func(server int) {
-				// fmt.Printf("node-%d sending StartView v=%d to node-%d\n", srv.me, svArgs.View, server)
+				log.Printf("node-%d sending StartView v=%d to node-%d\n", srv.me, svArgs.View, server)
 				srv.peers[server].Call("PBServer.StartView", svArgs, &reply)
 			}(i)
 		}
 	}()
 }
 
+func (srv *PBServer) sendViewChange(args *ViewChangeArgs, replies chan *ViewChangeReply) {
+	// send ViewChange to all servers including myself
+	for i := 0; i < len(srv.peers); i++ {
+		go func(server int) {
+			reply := new(ViewChangeReply)
+			ok := srv.peers[server].Call("PBServer.ViewChange", args, reply)
+
+			if ok && reply.Success {
+				replies <- reply
+			} else {
+				replies <- nil
+			}
+		}(i)
+	}
+}
+
 // determineNewViewLog is invoked to determine the log for the newView based on
 // the collection of replies for successful ViewChange requests.
 // if a quorum of successful replies exist, then ok is set to true.
 // otherwise, ok = false.
-func (srv *PBServer) determineNewViewLog(successReplies []*ViewChangeReply) (
-	ok bool, newViewLog []interface{}) {
+func (srv *PBServer) determineNewViewLog(successReplies []*ViewChangeReply) (ok bool, newViewLog []interface{}, newCommitIndex int) {
 	// Your code here
-	return ok, newViewLog
+	lastNormalView := -1
+	newCommitIndex = -1
+	newViewLog = make([]interface{}, 0)
+
+	// the new log is the one with the highest last normal view. If more than one such log exists, the longest log is used.
+	for i := range successReplies {
+		reply := successReplies[i]
+		if reply.Success && reply.LastNormalView >= lastNormalView && len(reply.Log) > len(newViewLog) {
+			newViewLog = reply.Log
+			lastNormalView = reply.LastNormalView
+
+			if reply.CommitIndex > newCommitIndex {
+				newCommitIndex = reply.CommitIndex
+			}
+		}
+	}
+
+	return len(successReplies) >= srv.replicationFactor(), newViewLog, newCommitIndex
 }
 
 // ViewChange is the RPC handler to process ViewChange RPC.
 func (srv *PBServer) ViewChange(args *ViewChangeArgs, reply *ViewChangeReply) {
 	// Your code here
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	reply.LastNormalView = srv.lastNormalView
+	reply.Log = srv.log
+	reply.CommitIndex = srv.commitIndex
+	reply.Success = args.View > srv.currentView
+
+	if reply.Success {
+		srv.status = VIEWCHANGE
+	}
+
+	log.Printf("node-%d received ViewChange for view %d with status %v.\n", srv.me, srv.currentView, srv.status)
 }
 
 // StartView is the RPC handler to process StartView RPC.
 func (srv *PBServer) StartView(args *StartViewArgs, reply *StartViewReply) {
 	// Your code here
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	log.Printf("node-%d received StartView for view %d.\n", srv.me, args.View)
+
+	if args.View > srv.currentView {
+		srv.currentView = args.View
+		srv.lastNormalView = args.View
+		srv.log = args.Log
+		srv.commitIndex = args.CommitIndex
+		srv.opIndex = len(args.Log) - 1
+		srv.status = NORMAL
+	}
 }

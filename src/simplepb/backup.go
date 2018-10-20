@@ -14,6 +14,13 @@ import (
 func (srv *PBServer) backupPrepare(arguments *PrepareArgs, reply *PrepareReply) {
 	log.Printf("Replica %v - [view %v commit %v op %v] - Received prepare (view: %v op: %v commit: %v entry: %v)", srv.me, srv.currentView, srv.commitIndex, srv.opIndex, srv.currentView, arguments.Index, arguments.PrimaryCommit, arguments.Entry)
 
+	if arguments.View < srv.currentView {
+		reply.View = srv.currentView
+		reply.Success = false
+
+		return
+	}
+
 	// Add the prepared operation to the min-heap for uncommitted ops
 	prepare := &Prepare{args: arguments, reply: reply, done: make(chan bool, 1)}
 	go srv.backupPrepareInOrder(prepare)
@@ -32,8 +39,13 @@ func (srv *PBServer) backupPrepareInOrder(prepare *Prepare) {
 
 	log.Printf("Replica %v - Preparing (view: %v op: %v commit: %v entry: %v)", srv.me, prepare.args.View, prepare.args.Index, prepare.args.PrimaryCommit, prepare.args.Entry)
 
+	if prepare.args.View > srv.currentView {
+		// this replica is in an old view
+		srv.backupRecover()
+	}
+
 	// Set recovery timer if primary does not reply in a timely fashion
-	timer := time.AfterFunc(2*time.Second, srv.executeRecovery)
+	timer := time.AfterFunc(srv.noCommitThreshold, srv.executeRecovery)
 
 	heap.Push(&srv.uncommittedOperations, prepare)
 	srv.executeUncommittedOperations()
@@ -81,7 +93,7 @@ func (srv *PBServer) executeRecovery() {
 	// Only go into recovery if it wasn't in recovery yet
 	// Also, verify the time of the last commit update, since a timer might have been set
 	// right after recovery finished
-	if srv.status == NORMAL && time.Since(srv.timeLastCommit).Seconds() > 2 {
+	if time.Since(srv.timeLastCommit).Nanoseconds() > srv.noCommitThreshold.Nanoseconds() {
 		srv.backupRecover()
 	}
 }
@@ -90,6 +102,10 @@ func (srv *PBServer) executeRecovery() {
 // Change replica state to RECOVERING, send recovery requests, and update log,
 // op index and commit index.
 func (srv *PBServer) backupRecover() {
+	if srv.status != NORMAL {
+		return
+	}
+
 	log.Printf("Replica %v - Recovering (view: %v op: %v commit: %v)", srv.me, srv.currentView, srv.opIndex, srv.commitIndex)
 
 	srv.status = RECOVERING
@@ -110,6 +126,7 @@ func (srv *PBServer) backupRecover() {
 	<-done
 
 	srv.status = NORMAL
+	srv.lastNormalView = srv.currentView
 
 	// Reply to uncommitted operations that were recovered
 	for srv.uncommittedOperations.Len() > 0 && srv.uncommittedOperations.Peek().args.Index <= srv.opIndex {
