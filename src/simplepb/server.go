@@ -188,7 +188,10 @@ func Make(peers []*labrpc.ClientEnd, me int, startingView int) *PBServer {
 func (srv *PBServer) Start(command interface{}) (index int, view int, ok bool) {
 	// do not process command if status is not NORMAL
 	// and if i am not the primary in the current view
-	if !srv.canPrepare() {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	if !srv.isNormalPrimary() {
 		return -1, srv.currentView, false
 	}
 
@@ -198,23 +201,29 @@ func (srv *PBServer) Start(command interface{}) (index int, view int, ok bool) {
 
 	// Normally, we would update the client table with the new request number before sending Prepare messages.
 	arguments := &PrepareArgs{View: srv.currentView, PrimaryCommit: srv.commitIndex, Index: srv.opIndex, Entry: command}
-	go srv.primaryPrepare(arguments)
+
+	log.Printf("Primary %v - Preparing (view: %v op: %v commit: %v entry: %v)", srv.me, srv.currentView, arguments.Index, srv.commitIndex, arguments.Entry)
+
+	replies := make(chan *PrepareReply, len(srv.peers))
+
+	for peer := range srv.peers {
+		if peer != srv.me {
+			go srv.primarySendPrepare(peer, arguments, replies)
+		}
+	}
+
+	go srv.primaryAwaitPrepare(arguments, replies)
 
 	return srv.opIndex, srv.currentView, true
 }
 
+// assumes the mutex is already locked
 func (srv *PBServer) appendCommand(command interface{}) {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-
 	srv.opIndex++
 	srv.log = append(srv.log, command)
 }
 
 func (srv *PBServer) replicationFactor() int {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-
 	f := (len(srv.peers) - 1) / 2
 
 	if f <= 0 {
@@ -246,9 +255,7 @@ func (srv *PBServer) sendPrepare(server int, args *PrepareArgs, reply *PrepareRe
 
 // Prepare is the RPC handler for the Prepare RPC
 func (srv *PBServer) Prepare(args *PrepareArgs, reply *PrepareReply) {
-	if srv.status == NORMAL && !srv.IsPrimary() {
-		srv.backupPrepare(args, reply)
-	}
+	srv.backupPrepare(args, reply)
 }
 
 func (srv *PBServer) sendRecovery(server int, args *RecoveryArgs, reply *RecoveryReply) bool {
@@ -258,9 +265,18 @@ func (srv *PBServer) sendRecovery(server int, args *RecoveryArgs, reply *Recover
 
 // Recovery is the RPC handler for the Recovery RPC
 func (srv *PBServer) Recovery(args *RecoveryArgs, reply *RecoveryReply) {
-	if srv.status == NORMAL && srv.IsPrimary() {
-		srv.primaryRecovery(args, reply)
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	reply.View = srv.currentView
+	reply.Success = srv.isNormalPrimary() && args.View <= srv.currentView
+
+	if reply.Success {
+		reply.PrimaryCommit = srv.commitIndex
+		reply.Entries = srv.log
 	}
+
+	log.Printf("Node %d received recover request in view %d from %d", srv.me, srv.currentView, args.Server)
 }
 
 // PromptViewChange starts a view change. Some external oracle prompts the primary of the newView to
