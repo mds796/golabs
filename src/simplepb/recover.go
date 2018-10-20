@@ -69,9 +69,16 @@ func (srv *PBServer) awaitRecovery(arguments *RecoveryArgs, replies chan *Recove
 		srv.mu.Lock()
 		defer srv.mu.Unlock()
 
+		if primary.View == srv.currentView {
+			for i := len(srv.log); i < len(primary.Entries); i++ {
+				srv.appendCommand(primary.Entries[i])
+			}
+		} else {
+			srv.log = primary.Entries
+		}
+
 		srv.currentView = primary.View
 		srv.commitIndex = primary.PrimaryCommit
-		srv.log = primary.Entries
 		srv.timeLastCommit = time.Now()
 		srv.status = NORMAL
 		srv.lastNormalView = srv.currentView
