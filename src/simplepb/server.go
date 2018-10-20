@@ -41,9 +41,10 @@ type PBServer struct {
 	opIndex               int             // The operation index in the log assigned to the most recently received request, initially 0.
 	uncommittedOperations OperationsQueue // a priority queue of the operations to be added to the log
 	timeLastCommit        time.Time       // The last time a backup updated its commit index
+	noCommitThreshold     int             // The amount of time until not hearing from the primary is grounds for recovery or a view change
 }
 
-// Prepare defines the arguments for the Prepare RPC
+// PrepareArgs defines the arguments for the Prepare RPC
 // Note that all field names must start with a capital letter for an RPC args struct
 type PrepareArgs struct {
 	View          int         // the primary's current view
@@ -59,12 +60,13 @@ type PrepareReply struct {
 	Success bool // whether the Prepare request has been accepted or rejected
 }
 
-// RecoverArgs defined the arguments for the Recovery RPC
+// RecoveryArgs defines the arguments for the Recovery RPC
 type RecoveryArgs struct {
 	View   int // the view that the backup would like to synchronize with
 	Server int // the server sending the Recovery RPC (for debugging)
 }
 
+// RecoveryReply defines the reply for the Recovery RPC
 type RecoveryReply struct {
 	View          int           // the view of the primary
 	Entries       []interface{} // the primary's log including entries replicated up to and including the view.
@@ -72,21 +74,25 @@ type RecoveryReply struct {
 	Success       bool          // whether the Recovery request has been accepted or rejected
 }
 
+// ViewChangeArgs defines the arguments for the ViewChange RPC
 type ViewChangeArgs struct {
 	View int // the new view to be changed into
 }
 
+// ViewChangeReply defines the reply for the ViewChange RPC
 type ViewChangeReply struct {
 	LastNormalView int           // the latest view which had a NORMAL status at the server
 	Log            []interface{} // the log at the server
 	Success        bool          // whether the ViewChange request has been accepted/rejected
 }
 
+// StartViewArgs defines the arguments for the StartView RPC
 type StartViewArgs struct {
 	View int           // the new view which has completed view-change
 	Log  []interface{} // the log associated with the new new
 }
 
+// StartViewReply defines the reply for the StartView RPC
 type StartViewReply struct {
 }
 
@@ -96,7 +102,7 @@ func GetPrimary(view int, nservers int) int {
 	return view % nservers
 }
 
-// True if this server is the primary for its current view, false otherwise.
+// IsPrimary is a predicate that returns true if this server is the primary for its current view, false otherwise.
 func (srv *PBServer) IsPrimary() bool {
 	return GetPrimary(srv.currentView, len(srv.peers)) == srv.me
 }
@@ -163,7 +169,7 @@ func Make(peers []*labrpc.ClientEnd, me int, startingView int) *PBServer {
 	return srv
 }
 
-// Start() is invoked by tester on some replica server to replicate a
+// Start is invoked by tester on some replica server to replicate a
 // command.  Only the primary should process this request by appending
 // the command to its log and then return *immediately* (while the log is being replicated to backup servers).
 // if this server isn't the primary, returns false.
@@ -247,7 +253,7 @@ func (srv *PBServer) Recovery(args *RecoveryArgs, reply *RecoveryReply) {
 	}
 }
 
-// Some external oracle prompts the primary of the newView to
+// PromptViewChange starts a view change. Some external oracle prompts the primary of the newView to
 // switch to the newView.
 // PromptViewChange just kicks start the view change protocol to move to the newView
 // It does not block waiting for the view change process to complete.
