@@ -83,15 +83,13 @@ type ViewChangeArgs struct {
 type ViewChangeReply struct {
 	LastNormalView int           // the latest view which had a NORMAL status at the server
 	Log            []interface{} // the log at the server
-	CommitIndex    int           // Last commit index
 	Success        bool          // whether the ViewChange request has been accepted/rejected
 }
 
 // StartViewArgs defines the arguments for the StartView RPC
 type StartViewArgs struct {
-	View        int           // the new view which has completed view-change
-	Log         []interface{} // the log associated with the new new
-	CommitIndex int           // Last commit index
+	View int           // the new view which has completed view-change
+	Log  []interface{} // the log associated with the new new
 }
 
 // StartViewReply defines the reply for the StartView RPC
@@ -246,6 +244,9 @@ func (srv *PBServer) sendRecovery(server int, args *RecoveryArgs, reply *Recover
 
 // Recovery is the RPC handler for the Recovery RPC
 func (srv *PBServer) Recovery(args *RecoveryArgs, reply *RecoveryReply) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
 	reply.View = srv.currentView
 	reply.Success = srv.isNormalPrimary() && args.View <= srv.currentView
 
@@ -266,7 +267,6 @@ func (srv *PBServer) Recovery(args *RecoveryArgs, reply *RecoveryReply) {
 func (srv *PBServer) PromptViewChange(newView int) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
-
 	newPrimary := GetPrimary(newView, len(srv.peers))
 
 	if newPrimary != srv.me { //only primary of newView should do view change
@@ -274,51 +274,52 @@ func (srv *PBServer) PromptViewChange(newView int) {
 	} else if newView <= srv.currentView {
 		return
 	}
-
-	vcArgs := &ViewChangeArgs{View: newView}
+	vcArgs := &ViewChangeArgs{
+		View: newView,
+	}
 	vcReplyChan := make(chan *ViewChangeReply, len(srv.peers))
-
-	srv.sendViewChange(vcArgs, vcReplyChan)
+	// send ViewChange to all servers including myself
+	for i := 0; i < len(srv.peers); i++ {
+		go func(server int) {
+			var reply ViewChangeReply
+			ok := srv.peers[server].Call("PBServer.ViewChange", vcArgs, &reply)
+			// fmt.Printf("node-%d (nReplies %d) received reply ok=%v reply=%v\n", srv.me, nReplies, ok, r.reply)
+			if ok {
+				vcReplyChan <- &reply
+			} else {
+				vcReplyChan <- nil
+			}
+		}(i)
+	}
 
 	// wait to receive ViewChange replies
 	// if view change succeeds, send StartView RPC
 	go func() {
-		successReplies := make([]*ViewChangeReply, 0, len(srv.peers))
-		success := 0
-		failure := 0
-
-		for i := 1; i < len(srv.peers); i++ {
-			r := <-vcReplyChan
-
-			if r == nil {
-				failure++
-			} else {
-				success++
+		var successReplies []*ViewChangeReply
+		var nReplies int
+		majority := len(srv.peers)/2 + 1
+		for r := range vcReplyChan {
+			nReplies++
+			if r != nil && r.Success {
 				successReplies = append(successReplies, r)
 			}
+			if nReplies == len(srv.peers) || len(successReplies) == majority {
+				break
+			}
 		}
-
-		log.Println("Received ViewChange replies from a majority of the replicas.")
-
-		ok, newLog, newCommitIndex := srv.determineNewViewLog(successReplies)
+		ok, log := srv.determineNewViewLog(successReplies)
 		if !ok {
-			log.Printf("Unable to determine the log for the new view. Received %v replies, needed %v.", len(successReplies), srv.replicationFactor())
 			return
 		}
-
-		log.Printf("Determine %d as the log for the new view %d with commit index %d.", newLog, newView, newCommitIndex)
-
 		svArgs := &StartViewArgs{
-			View:        vcArgs.View,
-			Log:         newLog,
-			CommitIndex: srv.commitIndex,
+			View: vcArgs.View,
+			Log:  log,
 		}
-
 		// send StartView to all servers including myself
 		for i := 0; i < len(srv.peers); i++ {
 			var reply StartViewReply
 			go func(server int) {
-				log.Printf("node-%d sending StartView v=%d to node-%d\n", srv.me, svArgs.View, server)
+				// fmt.Printf("node-%d sending StartView v=%d to node-%d\n", srv.me, svArgs.View, server)
 				srv.peers[server].Call("PBServer.StartView", svArgs, &reply)
 			}(i)
 		}
@@ -345,10 +346,9 @@ func (srv *PBServer) sendViewChange(args *ViewChangeArgs, replies chan *ViewChan
 // the collection of replies for successful ViewChange requests.
 // if a quorum of successful replies exist, then ok is set to true.
 // otherwise, ok = false.
-func (srv *PBServer) determineNewViewLog(successReplies []*ViewChangeReply) (ok bool, newViewLog []interface{}, newCommitIndex int) {
+func (srv *PBServer) determineNewViewLog(successReplies []*ViewChangeReply) (ok bool, newViewLog []interface{}) {
 	// Your code here
 	lastNormalView := -1
-	newCommitIndex = -1
 	newViewLog = make([]interface{}, 0)
 
 	// the new log is the one with the highest last normal view. If more than one such log exists, the longest log is used.
@@ -357,29 +357,24 @@ func (srv *PBServer) determineNewViewLog(successReplies []*ViewChangeReply) (ok 
 		if reply.Success && reply.LastNormalView >= lastNormalView && len(reply.Log) > len(newViewLog) {
 			newViewLog = reply.Log
 			lastNormalView = reply.LastNormalView
-
-			if reply.CommitIndex > newCommitIndex {
-				newCommitIndex = reply.CommitIndex
-			}
 		}
 	}
 
-	return len(successReplies) >= srv.replicationFactor(), newViewLog, newCommitIndex
+	return len(successReplies) >= srv.replicationFactor(), newViewLog
 }
 
 // ViewChange is the RPC handler to process ViewChange RPC.
 func (srv *PBServer) ViewChange(args *ViewChangeArgs, reply *ViewChangeReply) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
 
 	reply.LastNormalView = srv.lastNormalView
 	reply.Log = srv.log
-	reply.CommitIndex = srv.commitIndex
 	reply.Success = args.View > srv.currentView
 
 	log.Printf("node-%d received ViewChange for view %d with status %v, and log %v.\n", srv.me, args.View, srv.status, srv.log)
 
 	if reply.Success {
-		srv.mu.Lock()
-		defer srv.mu.Unlock()
 		srv.status = VIEWCHANGE
 	}
 }
@@ -396,7 +391,6 @@ func (srv *PBServer) StartView(args *StartViewArgs, reply *StartViewReply) {
 		srv.currentView = args.View
 		srv.lastNormalView = args.View
 		srv.log = args.Log
-		srv.commitIndex = args.CommitIndex
 		srv.opIndex = len(args.Log) - 1
 		srv.status = NORMAL
 	}

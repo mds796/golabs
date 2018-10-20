@@ -6,17 +6,20 @@ import (
 )
 
 func (srv *PBServer) recover() {
-	arguments, replies := srv.startRecovery()
-	srv.awaitRecovery(arguments, replies)
-}
-
-func (srv *PBServer) startRecovery() (arguments *RecoveryArgs, replies chan *RecoveryReply) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 
+	arguments, replies := srv.startRecovery()
+
+	if arguments != nil && replies != nil {
+		srv.awaitRecovery(arguments, replies)
+	}
+}
+
+func (srv *PBServer) startRecovery() (arguments *RecoveryArgs, replies chan *RecoveryReply) {
 	if srv.status != NORMAL {
 		log.Printf("Node %v - not in normal status (view: %v op: %v commit: %v, status: %d)", srv.me, srv.currentView, srv.opIndex, srv.commitIndex, srv.status)
-		return
+		return nil, nil
 	}
 
 	log.Printf("Node %v - Recovering (view: %v op: %v commit: %v)", srv.me, srv.currentView, srv.opIndex, srv.commitIndex)
@@ -51,24 +54,26 @@ func (srv *PBServer) sendRecoveryToPeer(peer int, arguments *RecoveryArgs, repli
 func (srv *PBServer) awaitRecovery(arguments *RecoveryArgs, replies chan *RecoveryReply) {
 	var primary *RecoveryReply
 	success := 0
+	maxView := srv.currentView
 
 	// index starts at 1 in order to skip the current server.
-	for i := 1; i < len(srv.peers); i++ {
+	for i := 1; (primary == nil || success < srv.replicationFactor()) && i < len(srv.peers); i++ {
 		reply := <-replies
 
 		if reply != nil {
 			success++
 
-			if reply.Success {
+			if reply.View > maxView {
+				maxView = reply.View
+			}
+
+			if reply.Success && maxView == reply.View {
 				primary = reply
 			}
 		}
 	}
 
-	if success >= srv.replicationFactor() && primary != nil {
-		srv.mu.Lock()
-		defer srv.mu.Unlock()
-
+	if success >= srv.replicationFactor() && primary != nil && primary.Success && maxView == primary.View {
 		if primary.View == srv.currentView {
 			for i := len(srv.log); i < len(primary.Entries); i++ {
 				srv.appendCommand(primary.Entries[i])

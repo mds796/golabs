@@ -1,3 +1,10 @@
+*.*/
+mrtmp.*
+824-mrinput-*.txt
+/main/diff.out
+/mapreduce/x.txt
+/pbservice/x.txt
+/kvpaxos/x.txt
 pkg/
 api.key
 *-handin.tar.gz
