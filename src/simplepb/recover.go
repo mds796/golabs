@@ -2,94 +2,62 @@ package simplepb
 
 import (
 	"log"
-	"time"
 )
 
-func (srv *PBServer) recover() {
+// StartRecovery sends Recover RPC messages to all peers.
+func (srv *PBServer) StartRecovery() {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 
-	arguments, replies := srv.startRecovery()
-
-	if arguments != nil && replies != nil {
-		srv.awaitRecovery(arguments, replies)
-	}
-}
-
-func (srv *PBServer) startRecovery() (arguments *RecoveryArgs, replies chan *RecoveryReply) {
 	if srv.status != NORMAL {
 		log.Printf("Node %v - not in normal status (view: %v op: %v commit: %v, status: %d)", srv.me, srv.currentView, srv.opIndex, srv.commitIndex, srv.status)
-		return nil, nil
+		return
 	}
 
 	log.Printf("Node %v - Recovering (view: %v op: %v commit: %v)", srv.me, srv.currentView, srv.opIndex, srv.commitIndex)
 
 	srv.status = RECOVERING
 
-	arguments = &RecoveryArgs{View: srv.currentView, Server: srv.me}
-	replies = make(chan *RecoveryReply, len(srv.peers))
+	args := &RecoveryArgs{View: srv.currentView, Server: srv.me}
 
-	// Send recovery requests to all peers. However, only the primary will reply with success
+	// Send recovery requests to all peers.
 	for peer := range srv.peers {
 		if peer != srv.me {
-			go srv.sendRecoveryToPeer(peer, arguments, replies)
+			go srv.RecoverFromPeer(peer, args)
 		}
-	}
-
-	return arguments, replies
-}
-
-func (srv *PBServer) sendRecoveryToPeer(peer int, arguments *RecoveryArgs, replies chan *RecoveryReply) {
-	reply := new(RecoveryReply)
-	completed := srv.sendRecovery(peer, arguments, reply)
-
-	if !completed {
-		replies <- nil
-	} else {
-		replies <- reply
 	}
 }
 
 // Update log, op index, commit index and server status on receiving one recovery reply
-func (srv *PBServer) awaitRecovery(arguments *RecoveryArgs, replies chan *RecoveryReply) {
-	var primary *RecoveryReply
-	success := 0
-	maxView := srv.currentView
+func (srv *PBServer) RecoverFromPeer(peer int, args *RecoveryArgs) {
+	reply := new(RecoveryReply)
+	ok := srv.sendRecovery(peer, args, reply)
 
-	// index starts at 1 in order to skip the current server.
-	for i := 1; (primary == nil || success < srv.replicationFactor()) && i < len(srv.peers); i++ {
-		reply := <-replies
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
 
-		if reply != nil {
-			success++
+	success := ok && reply.Success && srv.status == RECOVERING
 
-			if reply.View > maxView {
-				maxView = reply.View
-			}
+	if success && reply.View >= srv.currentView {
+		log.Printf("Node %v - will recover with commit index %d and op index %d and log %v.\n", srv.me, srv.commitIndex, srv.opIndex, srv.log)
 
-			if reply.Success && maxView == reply.View {
-				primary = reply
-			}
-		}
-	}
-
-	if success >= srv.replicationFactor() && primary != nil && primary.Success && maxView == primary.View {
-		if primary.View == srv.currentView {
-			for i := len(srv.log); i < len(primary.Entries); i++ {
-				srv.appendCommand(primary.Entries[i])
+		if reply.View == srv.currentView {
+			for i := len(srv.log); i < len(reply.Entries); i++ {
+				srv.opIndex++
+				srv.log = append(srv.log, reply.Entries[i])
 			}
 		} else {
-			srv.log = primary.Entries
+			srv.log = reply.Entries
 		}
 
-		srv.currentView = primary.View
-		srv.commitIndex = primary.PrimaryCommit
-		srv.timeLastCommit = time.Now()
 		srv.status = NORMAL
-		srv.lastNormalView = srv.currentView
+		srv.opIndex = len(reply.Entries) - 1
+		srv.commitIndex = reply.PrimaryCommit
+		srv.currentView = reply.View
+		srv.lastNormalView = reply.View
 
-		log.Printf("Node %v - recovered with commit index %d and op index %d.\n", srv.me, srv.commitIndex, srv.opIndex)
-	} else {
-		log.Printf("Node %v - Did not received sufficient recovery replies (%d) or primary did not reply (%v)", srv.me, success, primary == nil)
+		log.Printf("Node %v - recovered with commit index %d and op index %d and log %v.\n", srv.me, srv.commitIndex, srv.opIndex, srv.log)
+
+		go srv.prepareUncommittedOperations()
 	}
 }

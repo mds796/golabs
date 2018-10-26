@@ -38,10 +38,9 @@ type PBServer struct {
 	commitIndex int           // all log entries <= commitIndex are considered to have been committed.
 
 	// ... other state that you might need ...
-	opIndex               int             // The operation index in the log assigned to the most recently received request, initially 0.
-	uncommittedOperations OperationsQueue // a priority queue of the operations to be added to the log
-	timeLastCommit        time.Time       // The last time a backup updated its commit index
-	noCommitThreshold     time.Duration   // The amount of time until not hearing from the primary is grounds for recovery or a view change
+	opIndex             int             // The operation index in the log assigned to the most recently received request, initially 0.
+	operationsToPrepare OperationsQueue // a priority queue of the operations to be added to the log
+	prepareTimeout      time.Duration   // The amount of time until not hearing from the primary is grounds for recovery or a view change
 }
 
 // PrepareArgs defines the arguments for the Prepare RPC
@@ -146,17 +145,16 @@ func (srv *PBServer) Kill() {
 // startingView is the initial view (set to be zero) that all servers start in
 func Make(peers []*labrpc.ClientEnd, me int, startingView int) *PBServer {
 	srv := &PBServer{
-		peers:                 peers,
-		me:                    me,
-		currentView:           startingView,
-		lastNormalView:        startingView,
-		status:                NORMAL,
-		uncommittedOperations: make(OperationsQueue, 0),
-		timeLastCommit:        time.Now(),
-		noCommitThreshold:     2 * time.Second,
+		peers:               peers,
+		me:                  me,
+		currentView:         startingView,
+		lastNormalView:      startingView,
+		status:              NORMAL,
+		operationsToPrepare: make(OperationsQueue, 0, 2),
+		prepareTimeout:      100 * time.Millisecond,
 	}
 
-	heap.Init(&srv.uncommittedOperations)
+	heap.Init(&srv.operationsToPrepare)
 
 	// all servers' log are initialized with a dummy command at index 0
 	var v interface{}
@@ -178,28 +176,78 @@ func Make(peers []*labrpc.ClientEnd, me int, startingView int) *PBServer {
 // *if it's eventually committed*. The second return value is the current
 // view. The third return value is true if this server believes it is
 // the primary.
-func (srv *PBServer) Start(command interface{}) (index int, view int, ok bool) {
-	// do not process command if status is not NORMAL
-	// and if i am not the primary in the current view
+func (srv *PBServer) Start(command interface{}) (
+	index int, view int, ok bool) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
-
-	if !srv.isNormalPrimary() {
+	// do not process command if status is not NORMAL
+	// and if i am not the primary in the current view
+	if srv.status != NORMAL {
+		return -1, srv.currentView, false
+	} else if GetPrimary(srv.currentView, len(srv.peers)) != srv.me {
 		return -1, srv.currentView, false
 	}
 
-	// Normally, we would check the client table to see if we have already serviced this request.
-	// However, we do not have a last request number and cannot add one to the Start function.
-	srv.appendCommand(command)
-	go srv.primaryPrepare(srv.opIndex)
+	srv.opIndex++
+	srv.log = append(srv.log, command)
+
+	// Your code here
+	srv.prepareAllReplicas()
 
 	return srv.opIndex, srv.currentView, true
 }
 
-// assumes the mutex is already locked
-func (srv *PBServer) appendCommand(command interface{}) {
-	srv.opIndex++
-	srv.log = append(srv.log, command)
+// prepares an operation at all replicas.
+func (srv *PBServer) prepareAllReplicas() {
+	log.Printf("Primary %d preparing op %d\n", srv.me, srv.opIndex)
+
+	args := &PrepareArgs{View: srv.currentView, PrimaryCommit: srv.commitIndex, Index: srv.opIndex, Entry: srv.log[srv.opIndex]}
+	commit := &Commit{args: args}
+
+	for peer := range srv.peers {
+		if peer != srv.me {
+			go srv.prepareReplica(peer, commit)
+		}
+	}
+}
+
+// prepareReplica sends a prepare request to a single replica.
+// This function acquires the mutex lock in order to handle configuration changes.
+func (srv *PBServer) prepareReplica(peer int, commit *Commit) {
+	reply := new(PrepareReply)
+
+	srv.sendPrepare(peer, commit.args, reply)
+	srv.CommitOperation(commit, reply)
+}
+
+// CommitOperation updates the operation and commits it if enough replies were received
+func (srv *PBServer) CommitOperation(commit *Commit, reply *PrepareReply) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	// Update reply counts
+	if reply.Success {
+		commit.replicas++
+	} else {
+		commit.failures++
+	}
+
+	if commit.args.View < srv.currentView || reply.View > srv.currentView {
+		// Potentially no longer the primary, make sure this operation will not be committed
+	} else if reply.Success && commit.replicas == srv.replicationFactor() {
+		// commit the operation
+		srv.commitIndex = Max(srv.commitIndex, commit.args.Index)
+		log.Printf("Committed the log entry %d\n", commit.args.Index)
+	}
+}
+
+// Max returns the maximum of a and b
+func Max(a, b int) int {
+	if a > b {
+		return a
+	} else {
+		return b
+	}
 }
 
 func (srv *PBServer) replicationFactor() int {
@@ -212,7 +260,7 @@ func (srv *PBServer) replicationFactor() int {
 	return f
 }
 
-// exmple code to send an AppendEntries RPC to a server.
+// example code to send an AppendEntries RPC to a server.
 // server is the index of the target server in srv.peers[].
 // expects RPC arguments in args.
 // The RPC library fills in *reply with RPC reply, so caller should pass &reply.
@@ -247,20 +295,24 @@ func (srv *PBServer) Recovery(args *RecoveryArgs, reply *RecoveryReply) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 
+	isPrimary := GetPrimary(Max(args.View, srv.currentView), len(srv.peers)) == srv.me
+	statusNormal := srv.status == NORMAL
+	isHealthy := statusNormal && isPrimary
+	newerView := srv.currentView >= args.View
+
+	reply.Success = isHealthy && newerView
+	reply.PrimaryCommit = srv.commitIndex
+	reply.Entries = srv.log
 	reply.View = srv.currentView
-	reply.Success = srv.isNormalPrimary() && args.View <= srv.currentView
-
-	if reply.Success {
-		reply.PrimaryCommit = srv.commitIndex
-		reply.Entries = srv.log
-
-		go srv.primaryPrepare(srv.opIndex)
-	}
 
 	log.Printf("Node %d received recover request in view %d from %d", srv.me, srv.currentView, args.Server)
+
+	if reply.Success && srv.opIndex > srv.commitIndex {
+		srv.prepareAllReplicas()
+	}
 }
 
-// PromptViewChange starts a view change. Some external oracle prompts the primary of the newView to
+// Some external oracle prompts the primary of the newView to
 // switch to the newView.
 // PromptViewChange just kicks start the view change protocol to move to the newView
 // It does not block waiting for the view change process to complete.
@@ -326,30 +378,14 @@ func (srv *PBServer) PromptViewChange(newView int) {
 	}()
 }
 
-func (srv *PBServer) sendViewChange(args *ViewChangeArgs, replies chan *ViewChangeReply) {
-	// send ViewChange to all servers including myself
-	for i := 0; i < len(srv.peers); i++ {
-		go func(server int) {
-			reply := new(ViewChangeReply)
-			ok := srv.peers[server].Call("PBServer.ViewChange", args, reply)
-
-			if ok && reply.Success {
-				replies <- reply
-			} else {
-				replies <- nil
-			}
-		}(i)
-	}
-}
-
 // determineNewViewLog is invoked to determine the log for the newView based on
 // the collection of replies for successful ViewChange requests.
 // if a quorum of successful replies exist, then ok is set to true.
 // otherwise, ok = false.
 func (srv *PBServer) determineNewViewLog(successReplies []*ViewChangeReply) (ok bool, newViewLog []interface{}) {
 	// Your code here
-	lastNormalView := -1
-	newViewLog = make([]interface{}, 0)
+	lastNormalView := srv.lastNormalView
+	newViewLog = srv.log
 
 	// the new log is the one with the highest last normal view. If more than one such log exists, the longest log is used.
 	for i := range successReplies {
@@ -394,4 +430,11 @@ func (srv *PBServer) StartView(args *StartViewArgs, reply *StartViewReply) {
 		srv.opIndex = len(args.Log) - 1
 		srv.status = NORMAL
 	}
+}
+
+// Commit are operations yet to be committed
+type Commit struct {
+	args     *PrepareArgs
+	replicas int // used by the primary to count the number of replicas for an operation
+	failures int // used by the primary to count the number of failures for an operation
 }

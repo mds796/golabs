@@ -2,8 +2,8 @@ package simplepb
 
 import (
 	"container/heap"
+	"context"
 	"log"
-	"time"
 )
 
 // Process prepare messages in the backup, doing state transfer if necessary.
@@ -11,19 +11,81 @@ import (
 // However, the RPC may still return a response without processing the operation.
 // This case is alright since the master commits all previous operations if any future operations return true.
 // So, once we have all in order operations the next operation will eventually return true.
-func (srv *PBServer) backupPrepare(arguments *PrepareArgs, reply *PrepareReply) {
-	srv.prepareReply(arguments, reply)
+func (srv *PBServer) backupPrepare(args *PrepareArgs, reply *PrepareReply) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
 
-	if arguments.View > srv.currentView || (reply.Success && arguments.Index > srv.opIndex) {
-		// Add the prepared operation to the min-heap for uncommitted ops
-		prepare := &Prepare{args: arguments, reply: reply, done: make(chan bool, 1)}
-		go srv.backupPrepareInOrder(prepare)
-		<-prepare.done
+	log.Printf("Node %v - [view %v commit %v op %v] - Received prepare (view: %v op: %v commit: %v entry: %v)", srv.me, srv.currentView, srv.commitIndex, srv.opIndex, srv.currentView, args.Index, args.PrimaryCommit, args.Entry)
+
+	isPrimary := GetPrimary(Max(args.View, srv.currentView), len(srv.peers)) == srv.me
+	statusNormal := srv.status == NORMAL
+	isHealthy := statusNormal && !isPrimary
+	sameView := args.View == srv.currentView
+
+	reply.View = srv.currentView
+
+	prepare := &Prepare{args: args, reply: reply, done: make(chan bool, 1)}
+	heap.Push(&srv.operationsToPrepare, prepare)
+
+	if isHealthy && sameView {
+		srv.prepareUncommittedOperations()
+
+		reply.Success = srv.opIndex >= args.Index
+
+		if !reply.Success {
+			srv.awaitCompletionOrTimeout(prepare)
+		}
+	} else if args.View > srv.currentView {
+		go srv.StartRecovery()
 	}
 }
 
+func (srv *PBServer) prepareUncommittedOperations() {
+	for srv.hasNextOperation() {
+		next := heap.Pop(&srv.operationsToPrepare).(*Prepare)
+		next.reply.Success = true
+		next.done <- true
+
+		srv.commitIndex = Max(srv.commitIndex, next.args.PrimaryCommit)
+
+		if next.args.Index == srv.opIndex+1 {
+			srv.opIndex++
+			srv.log = append(srv.log, next.args.Entry)
+
+			log.Printf("Replica %v - Prepared (view: %v op: %v commit: %v entry: %v)", srv.me, next.args.View, next.args.Index, next.args.PrimaryCommit, next.args.Entry)
+		}
+	}
+}
+
+// awaitCompletionOrTimeout waits for the prepare to complete or timeout
+func (srv *PBServer) awaitCompletionOrTimeout(prepare *Prepare) {
+	srv.mu.Unlock()
+	defer srv.mu.Lock() // needed to avoid panic in caller function (defer unlock in caller)
+
+	timeout, _ := context.WithTimeout(context.Background(), srv.prepareTimeout)
+
+	select {
+	case <-prepare.done:
+		return // do nothing
+	case <-timeout.Done():
+		go srv.StartRecovery()
+	}
+}
+
+func (srv *PBServer) hasNextOperation() bool {
+	if srv.operationsToPrepare.Len() == 0 {
+		return false
+	}
+
+	args := srv.operationsToPrepare.Peek().args
+
+	sameView := args.View == srv.currentView
+	nextOperation := args.Index <= srv.opIndex+1
+
+	return sameView && nextOperation
+}
+
 func (srv *PBServer) prepareReply(arguments *PrepareArgs, reply *PrepareReply) {
-	log.Printf("Node %v - [view %v commit %v op %v] - Received prepare (view: %v op: %v commit: %v entry: %v)", srv.me, srv.currentView, srv.commitIndex, srv.opIndex, srv.currentView, arguments.Index, arguments.PrimaryCommit, arguments.Entry)
 
 	reply.View = srv.currentView
 	reply.Success = srv.status == NORMAL && !srv.IsPrimary() && arguments.View >= srv.currentView
@@ -33,48 +95,7 @@ func (srv *PBServer) prepareReply(arguments *PrepareArgs, reply *PrepareReply) {
 		defer srv.mu.Unlock()
 
 		srv.commitIndex = arguments.PrimaryCommit
-		srv.timeLastCommit = time.Now()
 	}
-}
-
-// Prepares the next set of operations that are in order from the current opIndex
-// Does nothing if the next operation is not in the PrepareQueue.
-// For example, if we had operations [2, 4, 5] and we just received a request to prepare #1,
-// We would process ops 1 and 2, but not 4 and 5. Once we receive the message to prepare 3,
-// only then would we prepare 3, 4, and 5 in order.
-// Notice that this may cause the primary to timeout waiting for a response, but that's okay.
-func (srv *PBServer) backupPrepareInOrder(prepare *Prepare) {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-
-	timer := time.AfterFunc(srv.noCommitThreshold, func() { srv.backupRecover(prepare) })
-
-	// Only go into recovery if it wasn't in recovery yet
-	// Also, verify the time of the last commit update, since a timer might have been set
-	// right after recovery finished
-	if prepare.args.View > srv.currentView {
-		go srv.backupRecover(prepare)
-		return
-	}
-
-	log.Printf("Replica %v - Preparing (view: %v op: %v commit: %v entry: %v)", srv.me, prepare.args.View, prepare.args.Index, prepare.args.PrimaryCommit, prepare.args.Entry)
-
-	heap.Push(&srv.uncommittedOperations, prepare)
-	srv.executeUncommittedOperations()
-
-	// Disable recovery timer if we managed to process all operations in the queue
-	if srv.uncommittedOperations.Len() == 0 {
-		timer.Stop()
-	}
-}
-
-func (srv *PBServer) backupRecover(prepare *Prepare) {
-	if prepare.args.View <= srv.currentView && time.Since(srv.timeLastCommit).Nanoseconds() < srv.noCommitThreshold.Nanoseconds() {
-		return
-	}
-
-	srv.recover()
-	srv.backupPrepareInOrder(prepare)
 }
 
 func (srv *PBServer) executeUncommittedOperations() {
@@ -87,8 +108,8 @@ func (srv *PBServer) executeUncommittedOperations() {
 	// In case the next operation does not arrive in a timely fashion, we consider
 	// the message to be lost. In this case, the recovery timer will fire and execute
 	// the recovery protocol.
-	for srv.uncommittedOperations.Len() > 0 && srv.isNextOperation(srv.uncommittedOperations.Peek()) {
-		message := heap.Pop(&srv.uncommittedOperations).(*Prepare)
+	for srv.operationsToPrepare.Len() > 0 && srv.isNextOperation(srv.operationsToPrepare.Peek()) {
+		message := heap.Pop(&srv.operationsToPrepare).(*Prepare)
 
 		if message.args.Index > srv.opIndex {
 			srv.opIndex = message.args.Index
